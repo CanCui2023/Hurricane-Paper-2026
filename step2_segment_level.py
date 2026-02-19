@@ -47,6 +47,7 @@ SPEED_COL_CANDIDATES = ["gps_speed", "speed"]
 ACCEL_COL_CANDIDATES = ["accel", "acceleration", "gps_accel", "accel_mphps"]
 TURN_COL_CANDIDATES = ["turning_delta", "heading_change", "turn_delta", "turning_change", "turning_change_deg", "turning_change_deg"]
 COUNTY_COL_CANDIDATES = ["fl_counties", "fl_countie", "county_code"]
+FUNC_CLASS_COL_CANDIDATES = ["func_class", "functional_class", "fclass", "fc"]
 
 EVENT103_COL = "eventtype103"
 EVENT201_COL = "eventtype201"
@@ -90,6 +91,64 @@ def mode_or_first(s: pd.Series):
     return s2.iloc[0]
 
 
+def deterministic_mode(s: pd.Series):
+    """
+    Return deterministic mode:
+    - unique mode -> mode value
+    - tie -> choose smallest numeric value if all numeric, otherwise lexicographically smallest string
+    - all missing -> NaN
+    """
+    s2 = s.dropna()
+    if s2.empty:
+        return np.nan
+
+    vc = s2.value_counts(dropna=True)
+    if vc.empty:
+        return np.nan
+
+    max_count = vc.iloc[0]
+    modes = vc[vc == max_count].index.tolist()
+    if len(modes) == 1:
+        return modes[0]
+
+    modes_series = pd.Series(modes)
+    modes_num = pd.to_numeric(modes_series, errors="coerce")
+    if modes_num.notna().all():
+        min_idx = int(modes_num.to_numpy(dtype=float).argmin())
+        return modes[min_idx]
+
+    return min(str(x) for x in modes)
+
+
+def polyline_distance_mile(lat: pd.Series, lon: pd.Series) -> float:
+    """Compute trajectory polyline length (sum of adjacent-point Haversine distances) in miles."""
+    lat_arr = pd.to_numeric(lat, errors="coerce").to_numpy(dtype=float)
+    lon_arr = pd.to_numeric(lon, errors="coerce").to_numpy(dtype=float)
+
+    if len(lat_arr) < 2 or len(lon_arr) < 2:
+        return 0.0
+
+    lat1 = np.radians(lat_arr[:-1])
+    lon1 = np.radians(lon_arr[:-1])
+    lat2 = np.radians(lat_arr[1:])
+    lon2 = np.radians(lon_arr[1:])
+
+    valid = np.isfinite(lat1) & np.isfinite(lon1) & np.isfinite(lat2) & np.isfinite(lon2)
+    if not np.any(valid):
+        return 0.0
+
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * (np.sin(dlon / 2.0) ** 2)
+    c = 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+
+    earth_radius_m = 6_371_000.0
+    meters = earth_radius_m * c
+    meters = np.where(valid, meters, 0.0)
+
+    return float(meters.sum() / 1609.344)
+
+
 def count_events_and_duration(flag: np.ndarray, tsec: np.ndarray, consec_max_gap: float) -> Tuple[int, float]:
     """
     flag: 0/1 array for a segment, in time order
@@ -122,7 +181,7 @@ def _count_consecutive2_runs_by_second(
     accel: pd.Series,
     threshold: float,
     is_brake: bool
-) -> int:
+) -> Tuple[int, float]:
     """
     Count number of continuous event-runs (length>=2 seconds) in time, ignoring NaN rows:
       1) collapse to 1 record per second (same timestamp) using last() after sorting
@@ -131,10 +190,10 @@ def _count_consecutive2_runs_by_second(
       4) require dt==1 between consecutive kept seconds to be considered consecutive
       5) count run starts where a run reaches length>=2 seconds
 
-    Returns event-run count (each continuous run counted once).
+    Returns (event-run count, duration_sec), where duration only sums runs with length>=2.
     """
     if ts.empty:
-        return 0
+        return 0, 0.0
 
     x = pd.DataFrame({"ts": ts, "acc": pd.to_numeric(accel, errors="coerce")}).copy()
     x["ts"] = pd.to_datetime(x["ts"], errors="coerce", utc=True)
@@ -145,8 +204,8 @@ def _count_consecutive2_runs_by_second(
 
     # Keep only valid accel values
     x = x.dropna(subset=["acc"])
-    if x.empty or len(x) < 2:
-        return 0
+    if x.empty:
+        return 0, 0.0
 
     dt = x["ts"].diff().dt.total_seconds()
     if is_brake:
@@ -154,12 +213,33 @@ def _count_consecutive2_runs_by_second(
     else:
         over = (x["acc"] >= threshold)
 
-    # A "consecutive link" happens when current second is over AND previous second is over AND dt==1
-    link = over & over.shift(1, fill_value=False) & (dt == 1)
+    event_count = 0
+    duration_sec = 0.0
+    run_len = 0
 
-    # Count run starts (each run counted once)
-    run_start = link & ~link.shift(1, fill_value=False)
-    return int(run_start.sum())
+    for i in range(len(x)):
+        is_over = bool(over.iloc[i])
+        is_consecutive = bool(i > 0 and dt.iloc[i] == 1)
+
+        if is_over:
+            if i > 0 and bool(over.iloc[i - 1]) and is_consecutive:
+                run_len += 1
+            else:
+                if run_len >= 2:
+                    event_count += 1
+                    duration_sec += float(run_len)
+                run_len = 1
+        else:
+            if run_len >= 2:
+                event_count += 1
+                duration_sec += float(run_len)
+            run_len = 0
+
+    if run_len >= 2:
+        event_count += 1
+        duration_sec += float(run_len)
+
+    return event_count, duration_sec
 
 
 def summarize_one_segment(df: pd.DataFrame,
@@ -168,7 +248,8 @@ def summarize_one_segment(df: pd.DataFrame,
                           speed_col: str,
                           accel_col: Optional[str],
                           turn_col: Optional[str],
-                          county_col: Optional[str]) -> Dict:
+                          county_col: Optional[str],
+                          func_class_col: Optional[str]) -> Dict:
     df = df.sort_values(time_col, kind="mergesort")
     n = len(df)
 
@@ -195,6 +276,11 @@ def summarize_one_segment(df: pd.DataFrame,
     if county_col is not None:
         out[county_col] = mode_or_first(df[county_col])
 
+    if func_class_col is not None and func_class_col in df.columns:
+        out["func_class"] = deterministic_mode(df[func_class_col])
+    else:
+        out["func_class"] = np.nan
+
     mid_idx = n // 2
     out["start_lat"] = df.iloc[0][lat_col]
     out["start_lon"] = df.iloc[0][lon_col]
@@ -202,6 +288,7 @@ def summarize_one_segment(df: pd.DataFrame,
     out["median_lon"] = df.iloc[mid_idx][lon_col]
     out["end_lat"] = df.iloc[-1][lat_col]
     out["end_lon"] = df.iloc[-1][lon_col]
+    out["segment_distance_mile"] = polyline_distance_mile(df[lat_col], df[lon_col])
 
     sp = pd.to_numeric(df[speed_col], errors="coerce")
     out["speed_mean"] = float(sp.mean()) if sp.notna().any() else np.nan
@@ -221,13 +308,13 @@ def summarize_one_segment(df: pd.DataFrame,
         out["accel_abs_sum"] = float(np.sum(np.abs(ac_valid))) if ac_valid.size else np.nan
 
         # UPDATED: time-consecutive-2-seconds event-runs, ignoring NaN rows via per-second collapse
-        hard_accel_runs = _count_consecutive2_runs_by_second(
+        hard_accel_runs, hard_accel_duration = _count_consecutive2_runs_by_second(
             ts=df[time_col],
             accel=df[accel_col],
             threshold=HARD_A_THRESHOLD,
             is_brake=False
         )
-        hard_brake_runs = _count_consecutive2_runs_by_second(
+        hard_brake_runs, hard_brake_duration = _count_consecutive2_runs_by_second(
             ts=df[time_col],
             accel=df[accel_col],
             threshold=HARD_A_THRESHOLD,
@@ -236,6 +323,8 @@ def summarize_one_segment(df: pd.DataFrame,
         out["hard_accel_event_count"] = hard_accel_runs
         out["hard_brake_event_count"] = hard_brake_runs
         out["hard_event_count"] = hard_accel_runs + hard_brake_runs
+        out["hard_accel_duration_sec"] = hard_accel_duration
+        out["hard_brake_duration_sec"] = hard_brake_duration
     else:
         out["accel_mean"] = np.nan
         out["accel_std"] = np.nan
@@ -244,6 +333,8 @@ def summarize_one_segment(df: pd.DataFrame,
         out["hard_accel_event_count"] = 0
         out["hard_brake_event_count"] = 0
         out["hard_event_count"] = 0
+        out["hard_accel_duration_sec"] = 0.0
+        out["hard_brake_duration_sec"] = 0.0
 
     # turning stats
     if turn_col is not None and turn_col in df.columns:
@@ -294,6 +385,7 @@ def process_one_file(path: Path, out_dir: Path) -> None:
     accel_col = pick_col(cols, ACCEL_COL_CANDIDATES, required=False)
     turn_col = pick_col(cols, TURN_COL_CANDIDATES, required=False)
     county_col = pick_col(cols, COUNTY_COL_CANDIDATES, required=False)
+    func_class_col = pick_col(cols, FUNC_CLASS_COL_CANDIDATES, required=False)
 
     date_tag = extract_date_tag(path.name)
     out_path = out_dir / f"segment_{date_tag}.csv.gz"
@@ -327,7 +419,7 @@ def process_one_file(path: Path, out_dir: Path) -> None:
             summaries.append(
                 summarize_one_segment(
                     g, seg_col, time_col, lat_col, lon_col,
-                    speed_col, accel_col, turn_col, county_col
+                    speed_col, accel_col, turn_col, county_col, func_class_col
                 )
             )
 
@@ -352,7 +444,7 @@ def process_one_file(path: Path, out_dir: Path) -> None:
             summaries.append(
                 summarize_one_segment(
                     g, seg_col, time_col, lat_col, lon_col,
-                    speed_col, accel_col, turn_col, county_col
+                    speed_col, accel_col, turn_col, county_col, func_class_col
                 )
             )
         out_df = pd.DataFrame(summaries)
