@@ -7,6 +7,7 @@ Output: segment_YYYY_M_D.csv.gz (one row per segment_id)
 
 Included:
 - fl_counties (mode)
+- func_class (mode)
 - start/median/end lat lon
 - speed stats: mean/median/std/min/max
 - accel stats: mean/std/abs_mean/abs_sum
@@ -46,6 +47,7 @@ SPEED_COL_CANDIDATES = ["gps_speed", "speed"]
 ACCEL_COL_CANDIDATES = ["accel", "acceleration", "gps_accel"]
 TURN_COL_CANDIDATES = ["turning_delta", "heading_change", "turn_delta", "turning_change"]
 COUNTY_COL_CANDIDATES = ["fl_counties", "fl_countie", "county_code"]
+FUNC_CLASS_COL_CANDIDATES = ["func_class", "functional_class", "fclass"]
 EVENT103_COL = "eventtype103"
 EVENT201_COL = "eventtype201"
 
@@ -174,7 +176,8 @@ def summarize_one_segment(df: pd.DataFrame,
                           speed_col: str,
                           accel_col: Optional[str],
                           turn_col: Optional[str],
-                          county_col: Optional[str]) -> Dict:
+                          county_col: Optional[str],
+                          func_class_col: Optional[str]) -> Dict:
     # Ensure sorted by time
     df = df.sort_values(time_col, kind="mergesort")
     n = len(df)
@@ -202,6 +205,10 @@ def summarize_one_segment(df: pd.DataFrame,
     # county (mode)
     if county_col is not None:
         out[county_col] = mode_or_first(df[county_col])
+
+    # functional class (mode)
+    if func_class_col is not None:
+        out[func_class_col] = mode_or_first(df[func_class_col])
 
     # coordinates: start / median / end
     mid_idx = n // 2
@@ -302,6 +309,7 @@ def process_one_file(path: Path, out_dir: Path) -> None:
     accel_col = pick_col(cols, ACCEL_COL_CANDIDATES, required=False)
     turn_col = pick_col(cols, TURN_COL_CANDIDATES, required=False)
     county_col = pick_col(cols, COUNTY_COL_CANDIDATES, required=False)
+    func_class_col = pick_col(cols, FUNC_CLASS_COL_CANDIDATES, required=False)
 
     date_tag = extract_date_tag(path.name)
     out_path = out_dir / f"segment_{date_tag}.csv.gz"
@@ -340,7 +348,7 @@ def process_one_file(path: Path, out_dir: Path) -> None:
             summaries.append(
                 summarize_one_segment(
                     g, seg_col, time_col, lat_col, lon_col,
-                    speed_col, accel_col, turn_col, county_col
+                    speed_col, accel_col, turn_col, county_col, func_class_col
                 )
             )
 
@@ -368,7 +376,7 @@ def process_one_file(path: Path, out_dir: Path) -> None:
             summaries.append(
                 summarize_one_segment(
                     g, seg_col, time_col, lat_col, lon_col,
-                    speed_col, accel_col, turn_col, county_col
+                    speed_col, accel_col, turn_col, county_col, func_class_col
                 )
             )
         out_df = pd.DataFrame(summaries)
